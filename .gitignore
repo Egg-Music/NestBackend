@@ -1,0 +1,52 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*.so
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Logs
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# Node (if a UI is added later)
+node_modules/
+
+# Env files
+.env
+.env.*
+!*.env.example
+api/.env
+api/.env.*
+!api/.env.example
+
+# Docker
+docker-data/
+*.pid
+
+
