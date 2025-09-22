@@ -1,5 +1,6 @@
 import json
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 SYSTEM = (
     "You are an assistant for a DAW. "
     "Return the smallest valid plan that achieves the user's intent. "
-    "Use only IDs provided in the project summary. Never delete data."
+    "Use only IDs provided in the project summary."
 )
 
 def _map_conversation(conversation: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
@@ -43,6 +44,61 @@ def make_messages(project_summary: Dict[str, Any], user_prompt: str, conversatio
     if not msgs or not (msgs[-1].get("role") == "user" and msgs[-1].get("content") == user_prompt):
         msgs.append({"role":"user",  "content": user_prompt})
     return msgs
+
+async def generate_apply_message(client: AsyncOpenAI, plan: List[Dict[str, Any]], project_summary: Optional[Dict[str, Any]] = None) -> str:
+    try:
+        sys_prompt = (
+            "You have successfully applied the user's requested changes in a DAW. "
+            "Given the applied action plan, reply with a concise confirmation (1-2 sentences) in past tense, "
+            "mentioning only the essentials (no code, no tool names)."
+        )
+        msgs = [
+            {"role": "system", "content": sys_prompt},
+            {"role": "user", "content": f"PLAN:\n{json.dumps(plan)[:6000]}\n\nPROJECT SUMMARY:\n{json.dumps(project_summary or {})[:4000]}"},
+        ]
+        resp = await client.chat.completions.create(
+            model=settings.openai_model,
+            messages=msgs,
+        )
+        return resp.choices[0].message.content or "Applied requested changes."
+    except Exception as e:
+        logger.warning("assistant.apply_message.fallback: %s", e)
+        # Fallback: simple deterministic summary
+        try:
+            parts = []
+            for a in plan:
+                t = a.get("type")
+                if t == "project.setTitle":
+                    parts.append(f"set project title to '{a.get('title')}'")
+                elif t == "transport.play":
+                    parts.append("started playback")
+                elif t == "transport.stop":
+                    parts.append("stopped playback")
+                elif t == "loop.set":
+                    parts.append(f"set loop to startBeat={a.get('startBeat')} lengthBeats={a.get('lengthBeats')}")
+                elif t == "track.add":
+                    parts.append(f"added track '{a.get('name')}'")
+                elif t == "track.rename":
+                    parts.append(f"renamed track {a.get('trackId')} to '{a.get('name')}'")
+                elif t == "track.setGain":
+                    parts.append(f"adjusted gain on track {a.get('trackId')}")
+                elif t == "track.toggleMute":
+                    parts.append(f"toggled mute on track {a.get('trackId')}")
+                elif t == "track.setColor":
+                    parts.append(f"set color of track {a.get('trackId')}")
+                elif t == "clip.addAudio":
+                    parts.append(f"added audio clip to track {a.get('trackId')} at beat {a.get('startBeat')}")
+                elif t == "clip.move":
+                    parts.append(f"moved clip {a.get('clipId')} to beat {a.get('startBeat')}")
+                elif t == "fx.setParam":
+                    parts.append(f"updated FX param on track {a.get('target',{}).get('trackId')}")
+            if not parts:
+                return "Applied requested changes."
+            if len(parts) == 1:
+                return parts[0][0].upper() + parts[0][1:] + "."
+            return (parts[0][0].upper() + parts[0][1:]) + ", then " + ", then ".join(parts[1:]) + "."
+        except:
+            return "Applied requested changes."
 
 def summarize_plan(plan: list[dict]) -> str:
     parts: list[str] = []
@@ -82,15 +138,19 @@ async def assistant(
     mode: str = Body("dryRun"),
     _: None = Depends(auth_dependency),
 ):
-    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s)
+    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s, max_retries=1)
     model = settings.openai_model
 
-    chat = await client.chat.completions.create(
-        model=model,
-        tools=[{"type":"function","function": execute_actions_tool}],
-        tool_choice="auto",
-        messages= make_messages(project_summary, prompt, conversation)
-    )
+    try:
+        chat = await client.chat.completions.create(
+            model=model,
+            tools=[{"type":"function","function": execute_actions_tool}],
+            tool_choice="auto",
+            messages= make_messages(project_summary, prompt, conversation)
+        )
+    except Exception as e:
+        logger.exception("assistant.openai_error: %s", e)
+        return {"type":"error","error": str(e)}
 
     msg = chat.choices[0].message
     tool_calls = msg.tool_calls or []
@@ -137,7 +197,7 @@ async def assistant_stream(
     mode: str = Body("dryRun"),
     _: None = Depends(auth_dependency),
 ):
-    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s)
+    client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s, max_retries=1)
     model = settings.openai_model
 
     async def gen():
@@ -210,6 +270,7 @@ async def assistant_stream(
             _, diffs_preview = bus.execute_plan(plan, "dryRun")
             yield _sse({"type":"plan", "preview": {"mods": diffs_preview}, "plan": plan})
         except Exception as e:
+            logger.exception("assistant.stream.openai_error: %s", e)
             yield _sse({"error": str(e)})
 
     headers = {
@@ -235,7 +296,94 @@ async def apply_plan(
         beat_unit=int(project_summary.get("timeSig",{}).get("denominator", 4))
     )
     results, diffs = bus.execute_plan(plan, "apply" if mode == "apply" else "dryRun")
+    apply_id = str(uuid.uuid4()) if mode == "apply" else None
     if mode == "apply":
-        return {"type":"applied", "preview": {"mods": diffs}, "results": results}
+        # Generate a brief confirmation message from the LLM
+        client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s, max_retries=1)
+        message = await generate_apply_message(client, plan, project_summary)
+        return {"type":"applied", "applyId": apply_id, "preview": {"mods": diffs}, "results": results, "message": message}
     return {"type":"plan", "preview": {"mods": diffs}, "plan": plan}
+
+
+@router.post("/apply/confirm")
+async def apply_confirm(
+    applyId: Optional[str] = Body(default=None),
+    plan: Optional[List[Dict[str, Any]]] = Body(default=None),
+    results: Optional[List[Dict[str, Any]]] = Body(default=None),
+    preview: Optional[Dict[str, Any]] = Body(default=None),
+    project: Optional[Dict[str, Any]] = Body(default=None),
+    project_summary: Optional[Dict[str, Any]] = Body(default=None),
+    _: None = Depends(auth_dependency),
+):
+    payload = {
+        "applyId": applyId,
+        "plan": plan,
+        "results": results,
+        "preview": preview,
+        "project": project,
+        "project_summary": project_summary,
+    }
+    logger.info("assistant.apply.confirm=%s", json.dumps(payload)[:4000])
+    return {"ok": True}
+
+
+@router.post("/apply/stream")
+async def apply_stream(
+    request: Request,
+    plan: List[Dict[str, Any]] = Body(...),
+    project_summary: Dict[str, Any] = Body(default_factory=dict),
+    _: None = Depends(auth_dependency),
+):
+    async def gen():
+        apply_id = str(uuid.uuid4())
+        try:
+            bus = ActionBus(
+                project_root=project_summary.get("projectRoot",""),
+                bpm=float(project_summary.get("bpm", 120)),
+                beat_unit=int(project_summary.get("timeSig",{}).get("denominator", 4))
+            )
+            results, diffs = bus.execute_plan(plan, "apply")
+            # Emit immediate applied frame so UI can update
+            yield _sse({
+                "type": "applied",
+                "applyId": apply_id,
+                "preview": {"mods": diffs},
+                "results": results,
+            })
+
+            # Now stream a short confirmation message
+            client = AsyncOpenAI(api_key=settings.openai_api_key, timeout=settings.openai_timeout_s, max_retries=1)
+            sys_prompt = (
+                "You have successfully applied the user's requested changes in a DAW. "
+                "Given the applied action plan, reply with a concise confirmation (1-2 sentences) in past tense, "
+                "mentioning only the essentials (no code, no tool names)."
+            )
+            msgs = [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": f"PLAN:\n{json.dumps(plan)[:6000]}\n\nPROJECT SUMMARY:\n{json.dumps(project_summary or {})[:4000]}"},
+            ]
+            stream = await client.chat.completions.create(
+                model=settings.openai_model,
+                messages=msgs,
+                stream=True,
+            )
+            async for chunk in stream:
+                if await request.is_disconnected():
+                    break
+                if not chunk.choices:
+                    continue
+                d = chunk.choices[0].delta
+                if d and getattr(d, "content", None):
+                    yield _sse({"delta": d.content})
+            yield _sse({"done": True})
+        except Exception as e:
+            logger.exception("assistant.apply_stream.error: %s", e)
+            yield _sse({"error": str(e)})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 

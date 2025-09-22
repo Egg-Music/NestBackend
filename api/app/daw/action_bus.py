@@ -80,8 +80,96 @@ class ActionBus:
         if t == "fx.setParam":
             target = action["target"]
             track_id = str(target["trackId"]) ; unit = str(target["unit"]) ; path = str(target["path"]) 
-            value = float(action["value"])
+            value_raw = action["value"]
+            value: Any
+            if isinstance(value_raw, (int, float)):
+                value = float(value_raw)
+            elif isinstance(value_raw, str):
+                # allow string for enums like slope or type
+                value = value_raw
+            else:
+                value = bool(value_raw)
             return {"ok": True}, [{"op": "replace", "path": f"/fx/{track_id}/{unit}/{path}", "value": value}]
+
+        if t == "fx.setParams":
+            target = action.get("target", {})
+            track_id = str(target.get("trackId", action.get("trackId", "")))
+            unit = str(target.get("unit", action.get("unit", "reverb")))
+            params = action.get("params", {})
+            diffs: List[Diff] = []
+            for key, val in params.items():
+                if isinstance(val, (int, float, bool, str)):
+                    diffs.append({"op": "replace", "path": f"/fx/{track_id}/{unit}/{key}", "value": val})
+            return {"ok": True}, diffs
+
+        if t == "fx.addUnit":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            unit = str(action.get("unit", "reverb"))
+            slot = action.get("slot")
+            bypass = bool(action.get("bypass", False))
+            params = action.get("params", {}) or {}
+            fx_id = "fx_" + (track_id or "") + "_" + unit
+            value: Dict[str, Any] = {"id": fx_id, "unit": unit, "bypass": bypass}
+            diffs: List[Diff] = []
+            # Add unit
+            if slot is None:
+                diffs.append({"op": "add", "path": f"/fx/{track_id}/units/-", "value": value})
+            else:
+                diffs.append({"op": "add", "path": f"/fx/{track_id}/units/{int(slot)}", "value": value})
+            # Apply initial params
+            for key, val in params.items():
+                # EQ uses full paths like eq/bands/0/type
+                if unit == "eq" and isinstance(key, str) and key.startswith("eq/"):
+                    diffs.append({"op": "replace", "path": f"/fx/{track_id}/eq/{key[3:]}", "value": val})
+                else:
+                    diffs.append({"op": "replace", "path": f"/fx/{track_id}/{unit}/{key}", "value": val})
+            return {"ok": True, "meta": {"fxId": fx_id}}, diffs
+
+        if t == "fx.setBypass":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            fx_id = str(action.get("fxId") or action.get("fx_id") or "")
+            bypass = bool(action.get("bypass", False))
+            path = f"/fx/{track_id}/units/{fx_id}/bypass" if fx_id else f"/fx/{track_id}/reverb/bypass"
+            return {"ok": True}, [{"op": "replace", "path": path, "value": bypass}]
+
+        if t == "fx.removeUnit":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            fx_id = str(action.get("fxId") or action.get("fx_id") or "")
+            if fx_id:
+                return {"ok": True}, [{"op": "remove", "path": f"/fx/{track_id}/units/{fx_id}"}]
+            # fallback: bypass default reverb
+            return {"ok": True}, [{"op": "replace", "path": f"/fx/{track_id}/reverb/bypass", "value": True}]
+
+        if t == "eq.batchSet":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            changes = action.get("changes", [])
+            diffs: List[Diff] = []
+            for ch in changes:
+                p = ch.get("path"); v = ch.get("value")
+                if not isinstance(p, str):
+                    continue
+                # If path already includes unit prefix, use as-is; otherwise prefix with unit
+                full_path = p if p.startswith("/") else f"/fx/{track_id}/eq/{p}"
+                diffs.append({"op": "replace", "path": full_path, "value": v})
+            return {"ok": True}, diffs
+
+        if t == "eq.addUnit":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            slot = action.get("slot")
+            fx_id = "fx_" + (track_id or "") + "_eq"
+            value: Dict[str, Any] = {"id": fx_id, "unit": "eq", "bypass": False}
+            if slot is None:
+                return {"ok": True, "meta": {"fxId": fx_id}}, [{"op": "add", "path": f"/fx/{track_id}/units/-", "value": value}]
+            return {"ok": True, "meta": {"fxId": fx_id}}, [{"op": "add", "path": f"/fx/{track_id}/units/{int(slot)}", "value": value}]
+
+        if t == "eq.setParam":
+            track_id = str(action.get("trackId") or action.get("track_id") or "")
+            path = str(action.get("path") or "")
+            val = action.get("value")
+            if not path:
+                return {"ok": False, "error": "missing path"}, []
+            full_path = path if path.startswith("/") else f"/fx/{track_id}/eq/{path}"
+            return {"ok": True}, [{"op": "replace", "path": full_path, "value": val}]
 
         if t == "track.toggleMute":
             # In real code, read current mute from core; here we just flip to True as a placeholder
